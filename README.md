@@ -299,9 +299,9 @@ nura/
 
 | Tier | RAM | Storage | Performance |
 |------|-----|---------|-------------|
-| **Minimum** | 8GB | 10GB | ~2s latency |
-| **Recommended** | 16GB | 15GB | ~800ms latency |
-| **Optimal** | 32GB + GPU | 20GB | ~400ms latency |
+| **Minimum** | 8GB | 5GB | ~2s latency |
+| **Recommended** | 16GB | 6GB | ~800ms latency |
+| **Optimal** | 32GB + GPU | 8GB | ~400ms latency |
 
 ## Installation
 
