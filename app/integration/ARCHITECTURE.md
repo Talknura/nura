@@ -1,46 +1,95 @@
-# Backbone Layer Architecture
+# Nura Backbone Architecture
 
-## Central Async Coordination for Nura Engines
+## Unified System: Voice + Engines + LLM
 
-The Backbone Layer is the central nervous system that coordinates all Nura engines with optimal parallelism and async operations for minimum latency.
+The Backbone Layer IS Nura - one unified system that handles everything from audio input to audio output.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           BACKBONE LAYER                                    │
+│                              NURA BACKBONE                                  │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
+│   AUDIO IN ──▶ VAD ──▶ STT ──┐                                              │
+│   (Microphone)  (Silero)  (Whisper)                                         │
+│                              │                                              │
+│                              ▼                                              │
 │   ┌───────────────────────────────────────────────────────────────────┐    │
-│   │                    CRITICAL PATH (Blocking)                        │    │
-│   │   VAD → STT → Safety+Intent → Temporal → Retrieval → LLM → TTS    │    │
-│   │                        Target: <1500ms                             │    │
+│   │                    CRITICAL PATH (<50ms)                           │    │
+│   │                                                                    │    │
+│   │   ┌─────────────────────────────────────────────────────────┐     │    │
+│   │   │     Safety        Intent        Temporal                │     │    │
+│   │   │      ~1ms    +     ~5ms    +      ~6ms    = ~12ms      │     │    │
+│   │   └─────────────────────────────────────────────────────────┘     │    │
+│   │                              │                                    │    │
+│   │                              ▼                                    │    │
+│   │   ┌─────────────────────────────────────────────────────────┐     │    │
+│   │   │              Retrieval (if PAST_SELF_REFERENCE)         │     │    │
+│   │   │                        ~10-50ms                         │     │    │
+│   │   └─────────────────────────────────────────────────────────┘     │    │
 │   └───────────────────────────────────────────────────────────────────┘    │
+│                              │                                              │
+│                              ▼                                              │
+│   ┌───────────────────────────────────────────────────────────────────┐    │
+│   │              LLM + SENTENCE BUFFER + TTS STREAMING                 │    │
+│   │                                                                    │    │
+│   │   LLM tokens ──▶ Sentence Buffer ──▶ TTS ──▶ Audio Out            │    │
+│   │                                                                    │    │
+│   │   Target: <500ms to first sentence heard                          │    │
+│   └───────────────────────────────────────────────────────────────────┘    │
+│                              │                                              │
+│                              ▼                                              │
+│                         AUDIO OUT ──▶ Speaker                               │
 │                                                                             │
 │   ┌───────────────────────────────────────────────────────────────────┐    │
-│   │                    ASYNC AFTER RESPONSE                            │    │
-│   │   Memory Write │ Adaptation │ Proactive │ HNSW Update │ Logging   │    │
-│   │                        Non-blocking                                │    │
-│   └───────────────────────────────────────────────────────────────────┘    │
-│                                                                             │
-│   ┌───────────────────────────────────────────────────────────────────┐    │
-│   │                    PREDICTIVE (Idle Time)                          │    │
-│   │   Pre-warm Embeddings │ Pre-fetch Memories │ Cache Context        │    │
+│   │                    ASYNC (After Response)                          │    │
+│   │                                                                    │    │
+│   │   Memory Write │ Adaptation │ Proactive │ HNSW Batch              │    │
+│   │                        (non-blocking)                              │    │
 │   └───────────────────────────────────────────────────────────────────┘    │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Core Components
+## Latency Breakdown
 
-### 1. BackboneLayer
+| Stage | Target | Component |
+|-------|--------|-----------|
+| VAD | ~1ms | Silero VAD (ONNX) |
+| STT | ~150ms | Faster Whisper base.en |
+| Safety + Intent | ~6ms | Parallel execution |
+| Temporal | ~6ms | Time parsing |
+| Retrieval | ~10-50ms | Only if needed |
+| LLM TTFT | ~100ms | Phi with GPU |
+| First Sentence | ~50ms | Buffer detection |
+| TTS TTFA | ~100ms | Kokoro (ONNX) |
+| **Total** | **<500ms** | First sentence heard |
 
-The central coordinator that manages all engine interactions.
+## Usage
+
+### Voice Turn (Primary Interface)
 
 ```python
 from app.integration import get_backbone
 
 backbone = get_backbone()
 
-# Full pipeline with LLM
+def on_audio(audio_bytes):
+    speaker.write(audio_bytes)
+
+result = backbone.process_voice_turn(
+    audio_bytes=recorded_audio,
+    user_id=123,
+    on_audio=on_audio
+)
+
+print(f"User said: {result.transcript}")
+print(f"Nura said: {result.response}")
+print(f"First sentence at: {result.timing['tts_first_audio']}ms")
+```
+
+### Text Mode (Fallback)
+
+```python
 result = backbone.process(
     user_input="What did I tell you about my job?",
     user_id=123,
@@ -48,288 +97,156 @@ result = backbone.process(
 )
 
 print(result.llm_output)
-print(result.timing)  # {"critical_total": 45.2, "llm": 120.5, ...}
 ```
 
-### 2. Critical Path Processing
-
-Blocking operations that must complete before response:
-
-| Step | Operation | Target Latency |
-|------|-----------|----------------|
-| 1 | Safety Check (parallel) | ~1ms |
-| 2 | Intent Classification (parallel) | ~5ms |
-| 3 | Temporal Parsing | ~1-6ms |
-| 4 | Retrieval (if needed) | ~10-50ms |
-| **Total** | Critical Path | **~20-60ms** |
+### Continuous VAD Streaming
 
 ```python
-# Just critical path (no LLM)
-ctx = backbone.process_critical_path(
-    user_input="Remember I like mornings",
-    user_id=123
-)
-
-print(ctx.intent_result)  # {"primary_intent": "EXPLICIT_MEMORY_COMMAND", ...}
-print(ctx.temporal_context)  # {"morning": True, ...}
-```
-
-### 3. AsyncOperationQueue
-
-Non-blocking operations after response is delivered:
-
-```python
-queue = backbone._async_queue
-
-# Queue memory write
-task_id = queue.enqueue_memory_write(
-    user_id=123,
-    role="user",
-    text="I prefer mornings",
-    session_id="session_1",
-    ts=datetime.now(timezone.utc),
-    temporal_tags={"morning": True}
-)
-
-# Check stats
-print(queue.get_stats())
-# {"queued": 3, "completed": 10, "failed": 0, "by_category": {...}}
-```
-
-### 4. DeferredProactiveQueue
-
-Proactive evaluation happens AFTER response is delivered, results cached for next turn:
-
-```python
-# Check if proactive ready from last turn
-result = backbone.get_proactive_result(user_id=123)
-if result and result.get("should_ask"):
-    # Include proactive question in response
-    pass
-
-# Proactive is automatically queued after PERSONAL_STATE intents
-```
-
-### 5. BatchedHNSWUpdater
-
-HNSW index updates are batched for efficiency:
-
-```python
-# Queue individual updates (non-blocking)
-backbone.queue_hnsw_update(
-    user_id=123,
-    tier="FACTS",
-    vector=embedding_vector,
-    memory_id="mem_123"
-)
-
-# Automatic flush every 5 seconds or 10 items
-```
-
-### 6. PredictiveCache
-
-Pre-compute likely operations during idle time:
-
-- Common follow-up embeddings ("yes", "no", "tell me more")
-- User context caching
-- Recent memory prefetch
-
-## Task Priorities
-
-| Priority | Level | Use Case |
-|----------|-------|----------|
-| PRIORITY_CRITICAL | 0 | Safety checks |
-| PRIORITY_HIGH | 1 | Memory writes |
-| PRIORITY_NORMAL | 2 | Adaptation updates |
-| PRIORITY_LOW | 3 | Proactive evaluation |
-| PRIORITY_IDLE | 4 | Predictive caching |
-
-## Latency Optimization Strategy
-
-### Before (Blocking Everything)
-
-```
-User Input
-    │
-    ▼
-Safety Check ──────────────────────────────────── 1ms
-    │
-    ▼
-Intent Classification ─────────────────────────── 5ms
-    │
-    ▼
-Temporal Parse ────────────────────────────────── 6ms
-    │
-    ▼
-Memory Write ──────────────────────────────────── 10ms  ← BLOCKING
-    │
-    ▼
-Retrieval ─────────────────────────────────────── 50ms
-    │
-    ▼
-Adaptation Update ─────────────────────────────── 10ms  ← BLOCKING
-    │
-    ▼
-Proactive Evaluation ──────────────────────────── 10ms  ← BLOCKING
-    │
-    ▼
-LLM Response ──────────────────────────────────── 200ms
-    │
-    ▼
-TOTAL: ~292ms before response
-```
-
-### After (Backbone Layer)
-
-```
-User Input
-    │
-    ├──────────────┐
-    ▼              ▼
-Safety Check   Intent Class  ─────────────────── 5ms (parallel)
-    │              │
-    └──────────────┘
-           │
-           ▼
-    Temporal Parse ────────────────────────────── 6ms
-           │
-           ▼
-    Retrieval (if needed) ─────────────────────── 50ms
-           │
-           ▼
-    LLM Response ──────────────────────────────── 200ms
-           │
-           ▼
-    RESPONSE DELIVERED ────────────────────────── ~260ms
-           │
-           └─────────────────────────────────────────────────┐
-                                                              ▼
-                              ┌────────────────────────────────────────┐
-                              │         ASYNC (Background)             │
-                              │                                        │
-                              │  Memory Write ──────────── 10ms        │
-                              │  Adaptation Update ─────── 10ms        │
-                              │  Proactive Eval ────────── 10ms        │
-                              │  HNSW Batch ────────────── batched     │
-                              │                                        │
-                              └────────────────────────────────────────┘
-```
-
-**Result: ~260ms vs ~292ms = 32ms saved + better perceived latency**
-
-## Usage Examples
-
-### Full Pipeline
-
-```python
-from app.integration import get_backbone
-
 backbone = get_backbone()
 
-def my_llm(ctx):
-    # Build prompt from context
-    return generate_response(ctx)
+for chunk in microphone.stream():
+    event = backbone.process_vad_chunk(chunk)
 
-result = backbone.process(
-    user_input="I'm feeling stressed about work",
-    user_id=123,
-    llm_callable=my_llm
-)
-
-# Response is delivered immediately
-print(result.llm_output)
-
-# Async tasks are running in background
-print(result.async_tasks)  # ["async_memory_1", "async_adaptation_1", ...]
+    if event and event.event_type == "speech_end":
+        result = backbone.process_voice_turn(
+            event.audio,
+            user_id=123,
+            on_audio=speaker.write
+        )
 ```
 
-### Critical Path Only
+## Key Design: Sentence Streaming
+
+The secret to <500ms first response is **not waiting for full LLM output**.
+
+```
+LLM generates:  "Hello. │ I'm Nura. │ How can I help?"
+                        │            │
+                        ▼            ▼
+TTS starts:     First sentence   Second sentence
+                immediately      in background
+                        │
+                        ▼
+User hears:     Audio at ~450ms  More audio...
+```
+
+**Why sentences, not words?**
+- Words are choppy and unnatural
+- Sentences are complete thoughts
+- Natural speech rhythm preserved
+
+## All Components (Local, No Cloud)
+
+| Component | Technology | Latency |
+|-----------|------------|---------|
+| VAD | Silero VAD (ONNX) | ~1ms/chunk |
+| STT | Faster Whisper | ~150ms |
+| Safety | Rule-based | ~1ms |
+| Intent | Semantic + Fast Path | ~5ms |
+| Temporal | Parser | ~6ms |
+| Memory | SQLite + HNSW | async |
+| Retrieval | HNSW search | ~10-50ms |
+| Adaptation | Profile update | async |
+| Proactive | Deferred eval | async |
+| LLM | Phi (llama.cpp) | ~100ms TTFT |
+| TTS | Kokoro (ONNX) | ~100ms TTFA |
+
+## Async Operations
+
+These run AFTER the response starts playing:
 
 ```python
-ctx = backbone.process_critical_path(
-    user_input="What did I say about meetings?",
-    user_id=123
-)
-
-# Use ctx for LLM
-llm_output = generate_response(ctx)
-
-# Manually queue async if needed
+# Automatically queued after voice turn
 backbone.queue_async_operations(ctx, llm_output)
-```
 
-### Check Proactive
-
-```python
-# At start of turn, check for cached proactive
-proactive = backbone.get_proactive_result(user_id=123)
-if proactive and proactive.get("should_ask"):
-    include_proactive = True
+# Includes:
+# - Memory write (if PERSONAL_STATE or EXPLICIT_MEMORY)
+# - Adaptation update (if PERSONAL_STATE)
+# - Proactive evaluation (deferred)
+# - HNSW batch updates (every 5s or 10 items)
 ```
 
 ## Configuration
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| ASYNC_WORKERS | 3 | Worker threads for async queue |
-| CRITICAL_WORKERS | 2 | Worker threads for parallel critical ops |
-| HNSW_BATCH_SIZE | 10 | Flush HNSW after this many updates |
-| HNSW_FLUSH_INTERVAL | 5.0s | Maximum time before HNSW flush |
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| NURA_PHI_MODEL | Path to Phi GGML model |
+| NURA_KOKORO_MODEL | Path to Kokoro ONNX (optional, auto-downloads) |
+| NURA_KOKORO_VOICES | Path to voices file (optional) |
+
+### Code Configuration
+
+```python
+# VAD settings (in backbone.py)
+VADConfig(
+    sample_rate=16000,
+    speech_threshold=0.5,
+    min_silence_ms=500
+)
+
+# TTS settings
+TTSConfig(
+    voice="af_heart",
+    use_onnx=True
+)
+```
 
 ## File Structure
 
 ```
 app/integration/
-├── backbone.py              # Central backbone layer
-├── async_memory_queue.py    # Legacy async queue
-├── parallel_engine_executor.py  # Legacy parallel executor
-├── optimized_voice_pipeline.py  # Voice pipeline
-├── __init__.py              # Module exports
-└── ARCHITECTURE.md          # This file
-```
+├── backbone.py          # THE Nura backbone (everything)
+├── __init__.py          # Module exports
+└── ARCHITECTURE.md      # This file
 
-## Engine Integration
-
-The backbone integrates with all Nura engines:
-
-| Engine | Critical Path | Async |
-|--------|---------------|-------|
-| Safety Layer | Yes (parallel) | - |
-| Intent Gate | Yes (parallel) | - |
-| Temporal Engine | Yes | - |
-| Retrieval Engine | Yes (conditional) | - |
-| Memory Engine | - | Yes (write) |
-| Adaptation Engine | - | Yes (update) |
-| Proactive Engine | - | Yes (deferred) |
-
-## Thread Safety
-
-- All queues use proper locking
-- Singleton access is thread-safe
-- Background workers use daemon threads
-- Graceful shutdown with `backbone.shutdown()`
-
-## Monitoring
-
-```python
-stats = backbone.get_stats()
-print(stats)
-# {
-#     "async_queue": {"queued": 2, "completed": 50, "failed": 0, ...},
-#     "proactive_cache_size": 5,
-#     "predictive_cache_size": 3
-# }
+app/voice/               # Voice components (imported by backbone)
+├── vad.py              # Silero VAD
+├── kokoro_tts.py       # Kokoro TTS
+└── streaming_pipeline.py  # Legacy (use backbone instead)
 ```
 
 ## Design Principles
 
-1. **Latency First**: Critical path is minimal and fast
-2. **Non-Blocking Writes**: All writes happen after response
-3. **Deferred Evaluation**: Proactive runs in background
-4. **Batched Updates**: HNSW updates are batched for efficiency
-5. **Predictive Caching**: Pre-compute during idle time
-6. **Graceful Degradation**: Missing engines don't break the pipeline
+1. **One System**: Voice + Engines + LLM are not separate - they're Nura
+2. **Sentence Streaming**: TTS starts on first sentence, not full response
+3. **Parallel Critical Path**: Safety and Intent run in parallel
+4. **Async Everything Else**: Memory/Adaptation/Proactive after response
+5. **Local First**: No cloud APIs, everything runs on device
+6. **Graceful Degradation**: Missing components don't break the system
+
+## Example: Full Voice Conversation
+
+```python
+from app.integration import get_backbone
+import sounddevice as sd
+
+backbone = get_backbone()
+
+# Record 3 seconds
+audio = sd.rec(int(3 * 16000), samplerate=16000, channels=1, dtype='int16')
+sd.wait()
+audio_bytes = audio.tobytes()
+
+# Process through Nura
+def play_audio(chunk):
+    # Queue audio for playback
+    audio_queue.put(chunk)
+
+result = backbone.process_voice_turn(
+    audio_bytes=audio_bytes,
+    user_id=1,
+    on_audio=play_audio
+)
+
+print(f"Transcript: {result.transcript}")
+print(f"Response: {result.response}")
+print(f"Timing: {result.timing}")
+# Timing: {'stt': 145.2, 'backbone': 48.3, 'llm_first_token': 95.1,
+#          'llm_first_sentence': 142.8, 'tts_first_audio': 238.5, 'total': 512.3}
+```
 
 ## Frozen: January 2025
 
-This architecture provides the async optimization layer for all Nura engines.
+This is the unified Nura backbone - Voice + Engines + LLM in one system.

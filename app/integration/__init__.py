@@ -1,13 +1,13 @@
 """
-Integration Module.
+Integration Module - Unified Nura Backbone.
 
-Central coordination layer for all Nura engines with async optimizations.
-The Backbone Layer coordinates all engines with minimal latency through:
-    - Critical path processing (blocking operations)
-    - Async operations (non-blocking, after response)
-    - Deferred proactive evaluation
-    - Batched HNSW updates
-    - Predictive caching
+The Backbone Layer IS Nura - coordinating:
+    - Voice I/O (VAD, STT, TTS with sentence streaming)
+    - All engines (Memory, Retrieval, Temporal, Adaptation, Proactive)
+    - LLM streaming
+    - Async operations for low latency
+
+Target: <500ms to first sentence heard
 """
 
 from app.integration.backbone import (
@@ -15,6 +15,7 @@ from app.integration.backbone import (
     BackboneContext,
     BackboneResult,
     BackboneTask,
+    VoiceResult,
     AsyncOperationQueue,
     DeferredProactiveQueue,
     BatchedHNSWUpdater,
@@ -49,6 +50,7 @@ __all__ = [
     "BackboneContext",
     "BackboneResult",
     "BackboneTask",
+    "VoiceResult",
     "AsyncOperationQueue",
     "DeferredProactiveQueue",
     "BatchedHNSWUpdater",

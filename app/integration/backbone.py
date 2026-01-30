@@ -1,39 +1,48 @@
 """
-Backbone Layer - Central Async Coordination for Nura Engines.
+Backbone Layer - Unified Nura System.
 
-The backbone layer is the central nervous system that coordinates all engines
-with optimal parallelism and async operations for minimum latency.
+The backbone layer IS Nura - the central nervous system that coordinates:
+- Voice I/O (VAD, STT, TTS)
+- All engines (Memory, Retrieval, Temporal, Adaptation, Proactive)
+- LLM streaming with sentence-level TTS
+- Async operations for low latency
 
 Architecture:
     ┌─────────────────────────────────────────────────────────────────────────────┐
-    │                           BACKBONE LAYER                                    │
+    │                              NURA BACKBONE                                  │
     ├─────────────────────────────────────────────────────────────────────────────┤
     │                                                                             │
+    │   AUDIO IN ──▶ VAD ──▶ STT ──┐                                              │
+    │                              │                                              │
+    │                              ▼                                              │
     │   ┌───────────────────────────────────────────────────────────────────┐    │
     │   │                    CRITICAL PATH (Blocking)                        │    │
-    │   │   VAD → STT → Safety+Intent → Temporal → Retrieval → LLM → TTS    │    │
-    │   │                        Target: <1500ms                             │    │
+    │   │         Safety + Intent (parallel) → Temporal → Retrieval          │    │
+    │   │                        Target: <50ms                               │    │
     │   └───────────────────────────────────────────────────────────────────┘    │
+    │                              │                                              │
+    │                              ▼                                              │
+    │   ┌───────────────────────────────────────────────────────────────────┐    │
+    │   │              LLM STREAMING + SENTENCE BUFFER + TTS                 │    │
+    │   │                  Target: <500ms to first sentence                  │    │
+    │   └───────────────────────────────────────────────────────────────────┘    │
+    │                              │                                              │
+    │                              ▼                                              │
+    │                         AUDIO OUT                                           │
     │                                                                             │
     │   ┌───────────────────────────────────────────────────────────────────┐    │
     │   │                    ASYNC AFTER RESPONSE                            │    │
-    │   │   Memory Write │ Adaptation │ Proactive │ HNSW Update │ Logging   │    │
-    │   │                        Non-blocking                                │    │
-    │   └───────────────────────────────────────────────────────────────────┘    │
-    │                                                                             │
-    │   ┌───────────────────────────────────────────────────────────────────┐    │
-    │   │                    PREDICTIVE (Idle Time)                          │    │
-    │   │   Pre-warm Embeddings │ Pre-fetch Memories │ Cache Context        │    │
+    │   │   Memory Write │ Adaptation │ Proactive │ HNSW Update             │    │
     │   └───────────────────────────────────────────────────────────────────┘    │
     │                                                                             │
     └─────────────────────────────────────────────────────────────────────────────┘
 
-Latency Optimization:
-    - Critical path only blocks on essential operations
-    - All writes happen after response starts
-    - Proactive evaluation deferred to after response
-    - HNSW updates batched for efficiency
-    - Predictive caching during idle time
+Latency Target: <500ms to first sentence heard
+    - STT: ~150ms (Faster Whisper)
+    - Backbone: ~50ms (Safety + Intent + Engines)
+    - LLM TTFT: ~100ms
+    - First Sentence: ~50ms buffer
+    - TTS TTFA: ~100ms
 """
 
 from __future__ import annotations
@@ -108,6 +117,33 @@ try:
     EMBEDDER_AVAILABLE = True
 except ImportError:
     EMBEDDER_AVAILABLE = False
+
+# Voice Components (VAD, STT, TTS)
+try:
+    from app.voice.vad import SileroVAD, VADConfig, VADEvent
+    VAD_AVAILABLE = True
+except ImportError:
+    VAD_AVAILABLE = False
+
+try:
+    from app.voice.kokoro_tts import KokoroTTS, TTSConfig, TTSChunk
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+
+try:
+    from faster_whisper import WhisperModel
+    STT_AVAILABLE = True
+except ImportError:
+    STT_AVAILABLE = False
+
+# LLM Streaming
+try:
+    from app.services.streaming_llm import StreamingLLM, LLMChunk
+    from app.services.optimized_llm import FastPhiStreamingLLM
+    LLM_STREAMING_AVAILABLE = True
+except ImportError:
+    LLM_STREAMING_AVAILABLE = False
 
 
 # =============================================================================
@@ -955,6 +991,289 @@ class BackboneLayer:
         self._batched_hnsw.shutdown()
         self._critical_executor.shutdown(wait=wait)
 
+    # -------------------------------------------------------------------------
+    # VOICE I/O (Unified with Engine Processing)
+    # -------------------------------------------------------------------------
+
+    def _ensure_voice_initialized(self) -> None:
+        """Initialize voice components on first use."""
+        if not hasattr(self, '_vad'):
+            self._vad = None
+            self._stt = None
+            self._tts = None
+            self._llm = None
+
+        if self._vad is None and VAD_AVAILABLE:
+            try:
+                self._vad = SileroVAD(VADConfig(
+                    sample_rate=16000,
+                    chunk_size_ms=30,
+                    speech_threshold=0.5,
+                    min_silence_ms=500
+                ))
+            except Exception as e:
+                print(f"[Backbone] VAD init failed: {e}")
+
+        if self._stt is None and STT_AVAILABLE:
+            try:
+                import os
+                device = "cuda" if os.path.exists("/dev/nvidia0") or os.name == "nt" else "cpu"
+                self._stt = WhisperModel("base.en", device=device, compute_type="float16" if device == "cuda" else "int8")
+            except Exception as e:
+                print(f"[Backbone] STT init failed: {e}")
+
+        if self._tts is None and TTS_AVAILABLE:
+            try:
+                self._tts = KokoroTTS(TTSConfig(voice="af_heart", use_onnx=True))
+            except Exception as e:
+                print(f"[Backbone] TTS init failed: {e}")
+
+        if self._llm is None and LLM_STREAMING_AVAILABLE:
+            try:
+                self._llm = FastPhiStreamingLLM()
+            except Exception as e:
+                print(f"[Backbone] LLM init failed: {e}")
+
+    def process_voice_turn(
+        self,
+        audio_bytes: bytes,
+        user_id: int,
+        on_audio: Callable[[bytes], None],
+        session_id: Optional[str] = None
+    ) -> 'VoiceResult':
+        """
+        Process a complete voice turn: Audio In → Engines → Audio Out
+
+        This is the unified entry point for voice interaction.
+        Target: <500ms to first sentence heard.
+
+        Args:
+            audio_bytes: Raw PCM audio (16-bit, 16kHz, mono)
+            user_id: User identifier
+            on_audio: Callback for audio output (called with chunks)
+            session_id: Optional session ID
+
+        Returns:
+            VoiceResult with transcript, response, and timing
+        """
+        self._ensure_initialized()
+        self._ensure_voice_initialized()
+
+        start_time = time.perf_counter()
+        timing = {}
+
+        # === STAGE 1: STT ===
+        stt_start = time.perf_counter()
+        transcript = self._transcribe(audio_bytes)
+        timing["stt"] = (time.perf_counter() - stt_start) * 1000
+
+        if not transcript:
+            return VoiceResult(
+                transcript="",
+                response="",
+                timing=timing,
+                success=False
+            )
+
+        # === STAGE 2: CRITICAL PATH (Safety + Intent + Engines) ===
+        ctx = self.process_critical_path(transcript, user_id, session_id)
+        timing["backbone"] = ctx.timing.get("critical_total", 0)
+
+        if not ctx.safety_passed:
+            refusal = "I'm sorry, I can't help with that."
+            self._synthesize_and_output(refusal, on_audio)
+            return VoiceResult(
+                transcript=transcript,
+                response=refusal,
+                timing=timing,
+                success=True
+            )
+
+        # === STAGE 3: LLM + TTS STREAMING ===
+        response, stream_timing = self._stream_llm_tts(ctx, on_audio, start_time)
+        timing.update(stream_timing)
+
+        # === STAGE 4: ASYNC OPERATIONS ===
+        self.queue_async_operations(ctx, response)
+
+        timing["total"] = (time.perf_counter() - start_time) * 1000
+        return VoiceResult(
+            transcript=transcript,
+            response=response,
+            timing=timing,
+            success=True
+        )
+
+    def _transcribe(self, audio_bytes: bytes) -> str:
+        """Transcribe audio to text using Faster Whisper."""
+        if self._stt is None:
+            return ""
+
+        try:
+            # Convert bytes to float32 numpy array
+            audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+            segments, _ = self._stt.transcribe(
+                audio,
+                beam_size=1,
+                language="en",
+                vad_filter=False,
+                without_timestamps=True
+            )
+
+            text = " ".join(seg.text.strip() for seg in segments)
+            return text.strip()
+        except Exception as e:
+            print(f"[Backbone] STT error: {e}")
+            return ""
+
+    def _stream_llm_tts(
+        self,
+        ctx: BackboneContext,
+        on_audio: Callable[[bytes], None],
+        pipeline_start: float
+    ) -> Tuple[str, Dict[str, float]]:
+        """
+        Stream LLM → TTS with sentence buffering.
+
+        Synthesizes first sentence immediately for low latency.
+        """
+        import re
+        import queue
+        import threading
+
+        timing = {
+            "llm_first_token": 0,
+            "llm_first_sentence": 0,
+            "tts_first_audio": 0
+        }
+
+        if self._llm is None or self._tts is None:
+            fallback = self._generate_fallback(ctx)
+            self._synthesize_and_output(fallback, on_audio)
+            return fallback, timing
+
+        # Build minimal prompt
+        prompt = self._build_voice_prompt(ctx)
+
+        # Sentence buffer
+        buffer = ""
+        full_response = ""
+        first_token_recorded = False
+        first_sentence_recorded = False
+        first_audio_recorded = False
+        min_sentence_chars = 20
+
+        # TTS queue for concurrent synthesis
+        tts_queue: queue.Queue[Optional[str]] = queue.Queue()
+
+        def tts_worker():
+            nonlocal first_audio_recorded, timing
+            while True:
+                sentence = tts_queue.get()
+                if sentence is None:
+                    break
+                for chunk in self._tts.synthesize_sentence(sentence):
+                    if chunk.audio:
+                        if not first_audio_recorded:
+                            timing["tts_first_audio"] = (time.perf_counter() - pipeline_start) * 1000
+                            first_audio_recorded = True
+                        on_audio(chunk.audio)
+
+        tts_thread = threading.Thread(target=tts_worker, daemon=True)
+        tts_thread.start()
+
+        try:
+            for chunk in self._llm.stream_generate(prompt):
+                if not first_token_recorded:
+                    timing["llm_first_token"] = (time.perf_counter() - pipeline_start) * 1000
+                    first_token_recorded = True
+
+                new_text = chunk.text[len(full_response):]
+                full_response = chunk.text
+                buffer += new_text
+
+                # Check for complete sentence
+                match = re.search(r'^(.*?[.!?])(?:\s+|$)', buffer)
+                if match and len(match.group(1)) >= min_sentence_chars:
+                    sentence = match.group(1).strip()
+                    buffer = buffer[match.end():].lstrip()
+
+                    if not first_sentence_recorded:
+                        timing["llm_first_sentence"] = (time.perf_counter() - pipeline_start) * 1000
+                        first_sentence_recorded = True
+
+                    tts_queue.put(sentence)
+
+                if chunk.is_final:
+                    break
+
+            # Flush remaining buffer
+            if buffer.strip():
+                tts_queue.put(buffer.strip())
+
+        except Exception as e:
+            print(f"[Backbone] LLM stream error: {e}")
+            full_response = self._generate_fallback(ctx)
+
+        tts_queue.put(None)
+        tts_thread.join(timeout=10.0)
+
+        return full_response.strip(), timing
+
+    def _build_voice_prompt(self, ctx: BackboneContext) -> str:
+        """Build minimal prompt for voice (fast TTFT)."""
+        context = ""
+
+        if ctx.retrieval_result and hasattr(ctx.retrieval_result, 'hits') and ctx.retrieval_result.hits:
+            hits = ctx.retrieval_result.hits[:2]
+            parts = [h.get('content', '')[:80] for h in hits]
+            context = "Context: " + " | ".join(parts) + "\n"
+
+        return f"{context}User: {ctx.user_input}\nAssistant:"
+
+    def _synthesize_and_output(self, text: str, on_audio: Callable[[bytes], None]) -> None:
+        """Synthesize text and send to audio output."""
+        if self._tts is None:
+            return
+
+        for chunk in self._tts.synthesize_stream(text):
+            if chunk.audio:
+                on_audio(chunk.audio)
+
+    def process_vad_chunk(self, audio_chunk: bytes) -> Optional[VADEvent]:
+        """
+        Process audio chunk through VAD.
+
+        Returns VADEvent if speech boundary detected.
+        Use this for continuous microphone streaming.
+        """
+        self._ensure_voice_initialized()
+        if self._vad is None:
+            return None
+        return self._vad.process_chunk(audio_chunk)
+
+
+# =============================================================================
+# VOICE RESULT
+# =============================================================================
+
+@dataclass
+class VoiceResult:
+    """Result from voice turn processing."""
+    transcript: str
+    response: str
+    timing: Dict[str, float]
+    success: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "transcript": self.transcript,
+            "response": self.response,
+            "timing": self.timing,
+            "success": self.success
+        }
+
 
 # =============================================================================
 # SINGLETON & EXPORTS
@@ -976,6 +1295,7 @@ __all__ = [
     "BackboneContext",
     "BackboneResult",
     "BackboneTask",
+    "VoiceResult",
     "AsyncOperationQueue",
     "DeferredProactiveQueue",
     "BatchedHNSWUpdater",
