@@ -40,9 +40,15 @@ Architecture:
 Latency Target: <500ms to first sentence heard
     - STT: ~150ms (Faster Whisper)
     - Backbone: ~50ms (Safety + Intent + Engines)
-    - LLM TTFT: ~100ms
+    - LLM TTFT: ~100ms (Qwen3-4B, 4096 context)
     - First Sentence: ~50ms buffer
-    - TTS TTFA: ~100ms
+    - TTS TTFA: ~100ms (Kokoro)
+
+LLM: Qwen3-4B with 4096 token context window
+    - System + Memory + Retrieval + Temporal: ~1,200 tokens
+    - User input: ~300 tokens
+    - Response: ~300 tokens
+    - Safety margin: ~2,200 tokens
 """
 
 from __future__ import annotations
@@ -137,13 +143,20 @@ try:
 except ImportError:
     STT_AVAILABLE = False
 
-# LLM Streaming
+# LLM Streaming (Qwen3-4B)
 try:
     from app.services.streaming_llm import StreamingLLM, LLMChunk
-    from app.services.optimized_llm import FastPhiStreamingLLM
+    from app.services.optimized_llm import (
+        Qwen3StreamingLLM,
+        SentenceStreamBuffer,
+        get_streaming_llm,
+        CONTEXT_BUDGET,
+    )
     LLM_STREAMING_AVAILABLE = True
 except ImportError:
     LLM_STREAMING_AVAILABLE = False
+    Qwen3StreamingLLM = None
+    SentenceStreamBuffer = None
 
 
 # =============================================================================
@@ -1030,7 +1043,7 @@ class BackboneLayer:
 
         if self._llm is None and LLM_STREAMING_AVAILABLE:
             try:
-                self._llm = FastPhiStreamingLLM()
+                self._llm = get_streaming_llm()  # Qwen3-4B with 4096 context
             except Exception as e:
                 print(f"[Backbone] LLM init failed: {e}")
 
@@ -1136,12 +1149,9 @@ class BackboneLayer:
         """
         Stream LLM → TTS with sentence buffering.
 
-        Synthesizes first sentence immediately for low latency.
+        Uses SentenceStreamBuffer for proper sentence detection.
+        Synthesizes first sentence immediately for <500ms latency.
         """
-        import re
-        import queue
-        import threading
-
         timing = {
             "llm_first_token": 0,
             "llm_first_sentence": 0,
@@ -1153,16 +1163,13 @@ class BackboneLayer:
             self._synthesize_and_output(fallback, on_audio)
             return fallback, timing
 
-        # Build minimal prompt
+        # Build prompt with context budget awareness
         prompt = self._build_voice_prompt(ctx)
 
-        # Sentence buffer
-        buffer = ""
-        full_response = ""
+        # Track timing
         first_token_recorded = False
         first_sentence_recorded = False
         first_audio_recorded = False
-        min_sentence_chars = 20
 
         # TTS queue for concurrent synthesis
         tts_queue: queue.Queue[Optional[str]] = queue.Queue()
@@ -1183,38 +1190,47 @@ class BackboneLayer:
         tts_thread = threading.Thread(target=tts_worker, daemon=True)
         tts_thread.start()
 
+        # Use SentenceStreamBuffer for proper sentence detection
+        def on_sentence(sentence: str):
+            nonlocal first_sentence_recorded, timing
+            if not first_sentence_recorded:
+                timing["llm_first_sentence"] = (time.perf_counter() - pipeline_start) * 1000
+                first_sentence_recorded = True
+            tts_queue.put(sentence)
+
+        if SentenceStreamBuffer is not None:
+            sentence_buffer = SentenceStreamBuffer(
+                on_sentence=on_sentence,
+                min_chars=20,
+                max_chars=200
+            )
+        else:
+            sentence_buffer = None
+
+        full_response = ""
         try:
             for chunk in self._llm.stream_generate(prompt):
                 if not first_token_recorded:
                     timing["llm_first_token"] = (time.perf_counter() - pipeline_start) * 1000
                     first_token_recorded = True
 
-                new_text = chunk.text[len(full_response):]
                 full_response = chunk.text
-                buffer += new_text
 
-                # Check for complete sentence
-                match = re.search(r'^(.*?[.!?])(?:\s+|$)', buffer)
-                if match and len(match.group(1)) >= min_sentence_chars:
-                    sentence = match.group(1).strip()
-                    buffer = buffer[match.end():].lstrip()
-
-                    if not first_sentence_recorded:
-                        timing["llm_first_sentence"] = (time.perf_counter() - pipeline_start) * 1000
-                        first_sentence_recorded = True
-
-                    tts_queue.put(sentence)
+                # Feed to sentence buffer
+                if sentence_buffer:
+                    sentence_buffer.feed(chunk.text)
 
                 if chunk.is_final:
                     break
 
-            # Flush remaining buffer
-            if buffer.strip():
-                tts_queue.put(buffer.strip())
+            # Flush remaining
+            if sentence_buffer:
+                sentence_buffer.flush()
 
         except Exception as e:
             print(f"[Backbone] LLM stream error: {e}")
             full_response = self._generate_fallback(ctx)
+            tts_queue.put(full_response)
 
         tts_queue.put(None)
         tts_thread.join(timeout=10.0)
