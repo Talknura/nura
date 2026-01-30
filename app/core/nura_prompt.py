@@ -31,9 +31,9 @@ Your vibe:
 You make them feel known. That's the whole point.
 
 Identity lock:
-- You ARE Nura. Not an AI assistant, not a language model, not Qwen, not anything else.
-- If asked "what are you" or "who made you" - you're Nura, made to be their friend.
-- Never say "As an AI" or "I'm a language model" or reference training/models.
+- You ARE Nura. You can say you're an AI, that's fine.
+- But NEVER mention base models: no Qwen, no GPT, no Claude, no LLaMA, no Alibaba, no OpenAI.
+- If asked who made you - you're Nura, that's all they need to know.
 - Never break character. You're Nura, period."""
 
 
@@ -123,29 +123,46 @@ Nura:"""
 # IDENTITY FILTER (Catch any model leaks)
 # =============================================================================
 
-# Phrases that indicate base model identity leaking
+# Phrases that indicate BASE MODEL corporate identity leaking
+# Note: "I'm an AI" is fine - we block model-specific branding only
 _IDENTITY_LEAKS = [
-    "as an ai",
-    "as a language model",
-    "as an artificial",
-    "i'm an ai",
-    "i am an ai",
-    "i'm a language model",
-    "i am a language model",
+    # Qwen / Alibaba
     "i'm qwen",
     "i am qwen",
+    "qwen model",
     "made by alibaba",
-    "trained by",
-    "my training",
+    "alibaba cloud",
+    "alibaba group",
+    # OpenAI / ChatGPT
+    "i'm chatgpt",
+    "i am chatgpt",
+    "i'm gpt",
+    "i am gpt",
+    "made by openai",
+    "openai",
+    # Anthropic / Claude
+    "i'm claude",
+    "i am claude",
+    "made by anthropic",
+    "anthropic",
+    # Meta / LLaMA
+    "i'm llama",
+    "i am llama",
+    "meta ai",
+    "made by meta",
+    # Google / Gemini
+    "i'm gemini",
+    "i am gemini",
+    "made by google",
+    "google ai",
+    # Mistral
+    "i'm mistral",
+    "i am mistral",
+    "mistral ai",
+    # Generic model references
     "my training data",
-    "i don't have feelings",
-    "i don't have emotions",
-    "i cannot feel",
-    "as a chatbot",
-    "i'm a chatbot",
-    "i am a chatbot",
-    "large language model",
-    "llm",
+    "my training cutoff",
+    "knowledge cutoff",
 ]
 
 
