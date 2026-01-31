@@ -190,6 +190,21 @@ PERSONAL_STATE_CONCEPTS = [
         category="PERSONAL_STATE",
         confidence_boost=0.15
     ),
+    IntentConcept(
+        name="personal_facts",
+        exemplars=[
+            "My name is", "I'm called", "Call me",
+            "I work as", "I am a developer", "I'm a teacher",
+            "I live in", "I'm from", "I grew up in",
+            "I'm married", "I have kids", "I have a dog",
+            "I'm studying", "I'm learning", "I just started",
+            "I like", "I love", "My favorite is",
+            "I'm interested in", "I enjoy", "I hate",
+            "I am", "I'm single", "I'm retired"
+        ],
+        category="PERSONAL_STATE",
+        confidence_boost=0.3
+    ),
 ]
 
 
@@ -345,7 +360,7 @@ class SemanticIntentAnalyzer:
         self,
         text: str,
         category: Optional[str] = None,
-        threshold: float = 0.45
+        threshold: float = 0.38
     ) -> List[Tuple[IntentConcept, float]]:
         """Find intent concepts matching the input text."""
         self._ensure_initialized()
@@ -367,7 +382,7 @@ class SemanticIntentAnalyzer:
         matches.sort(key=lambda x: x[1], reverse=True)
         return matches
 
-    def analyze(self, text: str, threshold: float = 0.42) -> IntentAnalysis:
+    def analyze(self, text: str, threshold: float = 0.38) -> IntentAnalysis:
         """
         Analyze text to determine user intent.
 

@@ -92,4 +92,43 @@ CREATE TABLE IF NOT EXISTS temporal_patterns (
 );
 
 CREATE INDEX IF NOT EXISTS idx_temporal_patterns_lookup ON temporal_patterns(user_id, pattern_type);
+
+-- =============================================================================
+-- SCHEMA UPGRADES (for existing databases)
+-- These are safe to run multiple times
+-- =============================================================================
+
+-- Add missing columns to facts table (for older databases)
+-- SQLite doesn't support IF NOT EXISTS for columns, so we use a workaround
 """
+
+# Additional migration to add missing columns
+SCHEMA_UPGRADES = """
+-- Upgrade facts table if columns are missing
+-- These will fail silently if columns already exist
+"""
+
+def run_schema_upgrades(conn) -> None:
+    """Add missing columns to existing databases."""
+    # Check facts table columns
+    cursor = conn.execute("PRAGMA table_info(facts)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    upgrades = []
+    if "history" not in existing_columns:
+        upgrades.append("ALTER TABLE facts ADD COLUMN history TEXT")
+    if "first_learned_at" not in existing_columns:
+        upgrades.append("ALTER TABLE facts ADD COLUMN first_learned_at TEXT DEFAULT (datetime('now'))")
+    if "embedding" not in existing_columns:
+        upgrades.append("ALTER TABLE facts ADD COLUMN embedding BLOB")
+
+    for sql in upgrades:
+        try:
+            conn.execute(sql)
+            print(f"[DB] Applied: {sql[:50]}...")
+        except Exception as e:
+            # Column might already exist
+            pass
+
+    if upgrades:
+        conn.commit()
